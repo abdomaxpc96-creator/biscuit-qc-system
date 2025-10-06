@@ -1,6 +1,8 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 const { logger } = require('../utils/logger');
+const fs = require('fs').promises;
+const path = require('path');
 
 // Enhanced Database configuration with improved performance settings
 const dbConfig = {
@@ -130,10 +132,56 @@ class Database {
       const missingTables = requiredTables.filter(table => !existingTables.includes(table));
       
       if (missingTables.length > 0) {
-        logger.warn('Missing database tables', { 
-          missingTables,
-          message: 'Please run the database_schema_optimized.sql script to create the required tables.'
-        });
+        logger.warn('Missing database tables', { missingTables });
+        
+        // Check how many tables exist in schema
+        const countRes = await client.query(`
+          SELECT COUNT(*)::int AS cnt 
+          FROM information_schema.tables 
+          WHERE table_schema = 'public'
+        `);
+        const tablesCount = countRes.rows[0]?.cnt || 0;
+        
+        if (tablesCount === 0) {
+          // Fresh database: apply full schema safely
+          logger.info('No tables found. Applying full schema from database_schema_fixed.sql');
+          await this._applySchemaFile(client, path.join(__dirname, '..', 'database_schema_fixed.sql'));
+          logger.info('Full schema applied successfully');
+        } else {
+          // Partially initialized DB: create only core tables needed to allow app to run
+          logger.info('Partially initialized DB detected. Creating missing core tables only');
+          await this._createCoreTablesIfMissing(client, existingTables);
+          
+          // Also ensure helper function exists for product configuration
+          await client.query(`
+            CREATE OR REPLACE FUNCTION get_product_configuration(product_uuid UUID)
+            RETURNS JSONB AS $$
+            DECLARE
+              result JSONB;
+            BEGIN
+              SELECT jsonb_build_object(
+                  'product', to_jsonb(p.*),
+                  'customVariables', COALESCE(
+                      (SELECT jsonb_agg(to_jsonb(cv.*)) FROM product_custom_variables cv WHERE cv.product_id = product_uuid), '[]'::jsonb
+                  ),
+                  'sections', COALESCE(
+                      (SELECT jsonb_agg(
+                          jsonb_build_object(
+                              'section', to_jsonb(ps.*),
+                              'parameters', COALESCE(
+                                  (SELECT jsonb_agg(to_jsonb(pp.*)) FROM product_parameters pp WHERE pp.section_id = ps.id ORDER BY pp.order_index, pp.parameter_name), '[]'::jsonb
+                              )
+                          )
+                      ) FROM product_sections ps WHERE ps.product_id = product_uuid ORDER BY ps.order_index, ps.section_name), '[]'::jsonb
+                  )
+              ) INTO result
+              FROM products p
+              WHERE p.id = product_uuid;
+              RETURN result;
+            END;
+            $$ LANGUAGE plpgsql;
+          `);
+        }
       } else {
         logger.info('All required tables exist');
       }
@@ -634,6 +682,111 @@ class Database {
     
     const result = await this.query(query, values);
     return parseInt(result.rows[0].count);
+  }
+  async _applySchemaFile(client, schemaPath) {
+    const sql = await fs.readFile(schemaPath, 'utf8');
+    await client.query(sql);
+  }
+
+  // Create minimal core tables if some are missing (non-destructive)
+  async _createCoreTablesIfMissing(client, existingTables) {
+    // Ensure required extensions
+    await client.query(`CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`);
+
+    if (!existingTables.includes('products')) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS products (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          product_id VARCHAR(100) UNIQUE NOT NULL,
+          name VARCHAR(255) NOT NULL,
+          code VARCHAR(50) NOT NULL,
+          batch_code VARCHAR(50),
+          ingredients_type VARCHAR(50) DEFAULT 'without-cocoa',
+          has_cream BOOLEAN DEFAULT FALSE,
+          standard_weight DECIMAL(10,3) DEFAULT 185.0,
+          shelf_life INTEGER DEFAULT 6,
+          cartons_per_pallet INTEGER DEFAULT 56,
+          packs_per_box INTEGER DEFAULT 6,
+          boxes_per_carton INTEGER DEFAULT 14,
+          empty_box_weight DECIMAL(10,3) DEFAULT 21.0,
+          empty_carton_weight DECIMAL(10,3) DEFAULT 680.0,
+          aql_level VARCHAR(20) DEFAULT '1.5',
+          day_format VARCHAR(10) DEFAULT 'DD',
+          month_format VARCHAR(20) DEFAULT 'letter',
+          description TEXT,
+          notes TEXT,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    }
+
+    if (!existingTables.includes('product_custom_variables')) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS product_custom_variables (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          name VARCHAR(100) NOT NULL,
+          value DECIMAL(15,6),
+          description TEXT,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(product_id, name)
+        );
+      `);
+    }
+
+    if (!existingTables.includes('product_sections')) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS product_sections (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+          section_id VARCHAR(100) NOT NULL,
+          section_name VARCHAR(255) NOT NULL,
+          section_type VARCHAR(50) DEFAULT 'quality_control',
+          order_index INTEGER DEFAULT 0,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(product_id, section_id)
+        );
+      `);
+    }
+
+    if (!existingTables.includes('product_parameters')) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS product_parameters (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          section_id UUID NOT NULL REFERENCES product_sections(id) ON DELETE CASCADE,
+          parameter_id VARCHAR(100) NOT NULL,
+          parameter_name VARCHAR(255) NOT NULL,
+          parameter_type VARCHAR(50) DEFAULT 'text',
+          default_value TEXT,
+          validation_rule JSONB,
+          calculation_formula JSONB,
+          order_index INTEGER DEFAULT 0,
+          is_required BOOLEAN DEFAULT FALSE,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(section_id, parameter_id)
+        );
+      `);
+    }
+
+    if (!existingTables.includes('reports')) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS reports (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          product_id UUID NOT NULL REFERENCES products(id),
+          product_name VARCHAR(255) NOT NULL,
+          batch_no VARCHAR(100) NOT NULL,
+          report_date DATE NOT NULL,
+          shift VARCHAR(50) NOT NULL,
+          status VARCHAR(50) DEFAULT 'draft',
+          created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+    }
   }
 }
 

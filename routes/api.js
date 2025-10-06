@@ -27,6 +27,20 @@ const validateUUID = (id) => {
 // GET /api/products - List all products
 router.get('/products', asyncHandler(async (req, res) => {
   const { search, active, limit = 100, offset = 0 } = req.query;
+
+  // If DB is in file mode, serve from file store directly
+  if (db.isFileMode) {
+    const { data, total } = await db.fileListProducts({ search, active, limit, offset });
+    return res.json({
+      data,
+      pagination: {
+        total,
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        count: data.length
+      }
+    });
+  }
   
   let conditions = {};
   let query = `
@@ -160,7 +174,7 @@ router.post('/products', asyncHandler(async (req, res) => {
       boxes_per_carton, empty_box_weight, empty_carton_weight, aql_level,
       day_format, month_format, description, notes
     ]);
-    
+
     const productUuid = productResult.rows[0].id;
     
     // Insert custom variables
@@ -202,6 +216,12 @@ router.post('/products', asyncHandler(async (req, res) => {
   
   // Return the created product with full configuration
   const configResult = await db.query('SELECT get_product_configuration($1) as config', [result]);
+
+  // If in file mode, ensure consistent response shape
+  if (db.isFileMode && (!configResult.rows[0] || !configResult.rows[0].config)) {
+    return res.status(201).json({ product: { id: result, product_id, name, code } });
+  }
+
   res.status(201).json(configResult.rows[0].config);
 }));
 

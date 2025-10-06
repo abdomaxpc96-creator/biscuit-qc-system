@@ -95,6 +95,8 @@ class Database {
   constructor() {
     this.pool = pool;
     this.connected = false;
+    this.mode = 'pg'; // 'pg' or 'file'
+    this._storePath = path.join(__dirname, '..', 'data', 'store.json');
   }
 
   // Initialize database connection and create tables if needed
@@ -113,7 +115,12 @@ class Database {
       return true;
     } catch (error) {
       logger.error('Database connection failed', { error });
-      throw error;
+      // Fallback to file-based mode to keep app usable
+      await this._initFileStore();
+      this.mode = 'file';
+      this.connected = false;
+      logger.warn('Switched to FILE mode (temporary fallback). Products can be added and listed without PostgreSQL.');
+      return true;
     }
   }
 
@@ -192,6 +199,9 @@ class Database {
 
   // Execute a query with connection from pool
   async query(text, params = []) {
+    if (this.mode === 'file') {
+      return this._fileQuery(text, params);
+    }
     const client = await this.pool.connect();
     try {
       const start = Date.now();
@@ -216,6 +226,21 @@ class Database {
 
   // Execute a transaction
   async transaction(callback) {
+    if (this.mode === 'file') {
+      // Emulate transaction using file store snapshot
+      const snapshot = JSON.stringify(await this._readStore());
+      const fileClient = {
+        query: async (text, params) => this._fileQuery(text, params)
+      };
+      try {
+        const result = await callback(fileClient);
+        return result;
+      } catch (error) {
+        // Rollback: restore snapshot
+        await this._writeStore(JSON.parse(snapshot));
+        throw error;
+      }
+    }
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -584,6 +609,7 @@ class Database {
 
   // Set user context for audit logging
   async setUserContext(userId) {
+    if (this.mode === 'file') return; // no-op in file mode
     try {
       await this.query('SELECT set_config($1, $2, false)', ['app.current_user_id', userId || 'system']);
     } catch (error) {
@@ -686,6 +712,187 @@ class Database {
   async _applySchemaFile(client, schemaPath) {
     const sql = await fs.readFile(schemaPath, 'utf8');
     await client.query(sql);
+  }
+
+  get isFileMode() {
+    return this.mode === 'file';
+  }
+
+  async _initFileStore() {
+    const dir = path.dirname(this._storePath);
+    await fs.mkdir(dir, { recursive: true });
+    try {
+      await fs.access(this._storePath);
+    } catch {
+      await this._writeStore({
+        products: [],
+        product_custom_variables: [],
+        product_sections: [],
+        product_parameters: [],
+        reports: []
+      });
+    }
+  }
+
+  async _readStore() {
+    const content = await fs.readFile(this._storePath, 'utf8');
+    return JSON.parse(content || '{}');
+  }
+
+  async _writeStore(data) {
+    await fs.writeFile(this._storePath, JSON.stringify(data, null, 2), 'utf8');
+  }
+
+  _uuid() {
+    try { return require('crypto').randomUUID(); } catch { /* node < 14 */ }
+    const { randomBytes } = require('crypto');
+    const bytes = randomBytes(16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = bytes.toString('hex');
+    return `${hex.substr(0,8)}-${hex.substr(8,4)}-${hex.substr(12,4)}-${hex.substr(16,4)}-${hex.substr(20)}`;
+  }
+
+  async _fileQuery(text, params = []) {
+    const store = await this._readStore();
+    const sql = (text || '').trim().toUpperCase();
+
+    // Health check
+    if (sql.startsWith('SELECT 1')) {
+      return { rows: [{ status: 1 }], rowCount: 1 };
+    }
+
+    // Product configuration
+    if (sql.includes('GET_PRODUCT_CONFIGURATION')) {
+      const id = params[0];
+      const product = store.products.find(p => p.id === id);
+      if (!product) return { rows: [{ config: {} }], rowCount: 1 };
+      const customVariables = store.product_custom_variables.filter(cv => cv.product_id === id);
+      const sections = store.product_sections
+        .filter(s => s.product_id === id)
+        .sort((a,b) => (a.order_index||0)-(b.order_index||0))
+        .map(s => ({
+          section: s,
+          parameters: store.product_parameters
+            .filter(pp => pp.section_id === s.id)
+            .sort((a,b) => (a.order_index||0)-(b.order_index||0))
+        }));
+      return { rows: [{ config: { product, customVariables, sections } }], rowCount: 1 };
+    }
+
+    // Inserts used by product creation route
+    if (sql.startsWith('INSERT INTO PRODUCTS')) {
+      const product = {
+        id: this._uuid(),
+        product_id: params[0],
+        name: params[1],
+        code: params[2],
+        batch_code: params[3],
+        ingredients_type: params[4],
+        has_cream: params[5],
+        standard_weight: params[6],
+        shelf_life: params[7],
+        cartons_per_pallet: params[8],
+        packs_per_box: params[9],
+        boxes_per_carton: params[10],
+        empty_box_weight: params[11],
+        empty_carton_weight: params[12],
+        aql_level: params[13],
+        day_format: params[14],
+        month_format: params[15],
+        description: params[16],
+        notes: params[17],
+        is_active: true,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      store.products.push(product);
+      await this._writeStore(store);
+      return { rows: [{ id: product.id }], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO PRODUCT_CUSTOM_VARIABLES')) {
+      const row = {
+        id: this._uuid(),
+        product_id: params[0],
+        name: params[1],
+        value: params[2],
+        description: params[3],
+        created_at: new Date().toISOString()
+      };
+      store.product_custom_variables.push(row);
+      await this._writeStore(store);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO PRODUCT_SECTIONS')) {
+      const row = {
+        id: this._uuid(),
+        product_id: params[0],
+        section_id: params[1],
+        section_name: params[2],
+        section_type: params[3],
+        order_index: params[4],
+        is_active: true,
+        created_at: new Date().toISOString()
+      };
+      store.product_sections.push(row);
+      await this._writeStore(store);
+      return { rows: [{ id: row.id }], rowCount: 1 };
+    }
+
+    if (sql.startsWith('INSERT INTO PRODUCT_PARAMETERS')) {
+      const row = {
+        id: this._uuid(),
+        section_id: params[0],
+        parameter_id: params[1],
+        parameter_name: params[2],
+        parameter_type: params[3],
+        default_value: params[4],
+        validation_rule: params[5] ? JSON.parse(params[5]) : null,
+        calculation_formula: params[6] ? JSON.parse(params[6]) : null,
+        order_index: params[7],
+        is_required: params[8],
+        is_active: true,
+        created_at: new Date().toISOString()
+      };
+      store.product_parameters.push(row);
+      await this._writeStore(store);
+      return { rows: [], rowCount: 1 };
+    }
+
+    // Generic selects by ID for products
+    if (sql.startsWith('SELECT * FROM PRODUCTS WHERE ID =')) {
+      const id = params[0];
+      const row = store.products.find(p => p.id === id);
+      return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+
+    // Fallback
+    logger.warn('File-mode query not implemented for SQL:', { text });
+    return { rows: [], rowCount: 0 };
+  }
+
+  async fileListProducts({ search, active, limit = 100, offset = 0 }) {
+    const store = await this._readStore();
+    let items = store.products.slice();
+    if (active !== undefined) {
+      const act = active === 'true' || active === true;
+      items = items.filter(p => (p.is_active ?? true) === act);
+    }
+    if (search) {
+      const s = search.toLowerCase();
+      items = items.filter(p =>
+        (p.name || '').toLowerCase().includes(s) ||
+        (p.product_id || '').toLowerCase().includes(s) ||
+        (p.code || '').toLowerCase().includes(s)
+      );
+    }
+    const total = items.length;
+    const paged = items.sort((a,b)=> new Date(b.created_at) - new Date(a.created_at)).slice(parseInt(offset), parseInt(offset) + parseInt(limit));
+    // Add derived fields to align with API response
+    const rows = paged.map(p => ({ ...p, reports_count: 0, last_report_date: null }));
+    return { data: rows, total };
   }
 
   // Create minimal core tables if some are missing (non-destructive)

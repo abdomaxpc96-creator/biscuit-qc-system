@@ -1,2 +1,6 @@
 node_modules
 .env
+# Ignore logs and local data store
+logs/
+logs/*.log
+data/*.json

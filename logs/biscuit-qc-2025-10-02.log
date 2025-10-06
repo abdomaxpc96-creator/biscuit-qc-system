@@ -1,5 +1,0 @@
-{"timestamp":"2025-10-02T15:40:01.395Z","level":"INFO","service":"biscuit-qc","message":"Application starting","nodeVersion":"v20.19.5","platform":"linux","pid":6011,"config":{"port":3000,"database":"configured"}}
-{"timestamp":"2025-10-02T15:49:16.205Z","level":"INFO","service":"biscuit-qc","message":"Application starting","nodeVersion":"v22.20.0","platform":"win32","pid":23596,"config":{"port":3000,"database":"configured"}}
-{"timestamp":"2025-10-02T15:49:16.221Z","level":"INFO","service":"biscuit-qc","message":"Application starting","nodeVersion":"v22.20.0","platform":"win32","pid":23032,"config":{"port":3000,"database":"configured"}}
-{"timestamp":"2025-10-02T15:49:56.210Z","level":"INFO","service":"biscuit-qc","message":"Application starting","nodeVersion":"v22.20.0","platform":"win32","pid":23232,"config":{"port":3000,"database":"configured"}}
-{"timestamp":"2025-10-02T15:49:56.211Z","level":"INFO","service":"biscuit-qc","message":"Application starting","nodeVersion":"v22.20.0","platform":"win32","pid":22596,"config":{"port":3000,"database":"configured"}}

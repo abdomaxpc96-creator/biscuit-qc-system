@@ -614,6 +614,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize products from localStorage or use default with error handling
     let products;
 
+    // Products will be loaded via API by product-api-integration.js
+    // Keep localStorage as fallback only
     try {
         const savedProducts = localStorage.getItem('productConfigurations');
         products = savedProducts ? JSON.parse(savedProducts) : null;
@@ -8527,28 +8529,72 @@ Return a JSON object with these properties (omit any you don't need):\n\n{
 
 
     // Edit product
-    function editProduct(productId) {
-        const product = products[productId];
+    async function editProduct(productId) {
+        // First try local cache
+        let product = products[productId];
+        
+        // If not in cache and API is available, try to fetch from API
+        if (!product && typeof window.apiClient !== 'undefined') {
+            try {
+                const productsResponse = await window.apiClient.getProducts();
+                const apiProduct = productsResponse.data?.find(p => p.product_id === productId);
+                
+                if (apiProduct && apiProduct.id) {
+                    const configResponse = await window.apiClient.getProduct(apiProduct.id);
+                    product = window.ProductAPIMapper.toUIFormat(configResponse);
+                    
+                    // Update cache
+                    if (product) {
+                        products[productId] = product;
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to fetch product from API:', error);
+            }
+        }
+        
         if (product) {
             openProductModal(product);
+        } else {
+            console.error(`Product ${productId} not found`);
+            if (typeof showNotification === 'function') {
+                showNotification('Product not found', 'error');
+            }
         }
     }
 
     // Delete product
-    function deleteProduct(productId) {
-        if (confirm('Are you sure you want to delete this product?')) {
-            delete products[productId];
-            localStorage.setItem('productConfigurations', JSON.stringify(products));
-            renderProductsTable();
-            // Preserve selection when deleting a different product
-            populateProductDropdown(true);
-            showNotification('Product deleted successfully!');
+    async function deleteProduct(productId) {
+        // Use API if available, otherwise fall back to localStorage
+        if (typeof window.deleteProductWithAPI === 'function') {
+            try {
+                await window.deleteProductWithAPI(productId);
+            } catch (error) {
+                console.error('API delete failed, falling back to localStorage:', error);
+                // Fallback to localStorage
+                if (confirm('Are you sure you want to delete this product?')) {
+                    delete products[productId];
+                    localStorage.setItem('productConfigurations', JSON.stringify(products));
+                    renderProductsTable();
+                    populateProductDropdown(true);
+                    showNotification('Product deleted successfully!');
+                }
+            }
+        } else {
+            // Fallback to localStorage if API not available
+            if (confirm('Are you sure you want to delete this product?')) {
+                delete products[productId];
+                localStorage.setItem('productConfigurations', JSON.stringify(products));
+                renderProductsTable();
+                populateProductDropdown(true);
+                showNotification('Product deleted successfully!');
+            }
         }
     }
 
     // Enhanced save product function with date format handling
 
-    function saveProduct(e) {
+    async function saveProduct(e) {
         e.preventDefault();
 
         // -- Manual field validation --
@@ -8795,9 +8841,10 @@ Return a JSON object with these properties (omit any you don't need):\n\n{
             });
 
 
-            products[productId] = {
+            const productData = {
                 id: productId,
                 name: productName,
+                code: productId, // Use productId as code if not explicitly set
                 standardWeight: productStandardWeight,
                 shelfLife: productShelfLife,
                 cartonsPerPallet: productCartonsPerPallet,
@@ -8818,6 +8865,19 @@ Return a JSON object with these properties (omit any you don't need):\n\n{
                 sections: sections
             };
 
+            // Try to save via API first, fallback to localStorage
+            if (typeof window.saveProductWithAPI === 'function') {
+                try {
+                    await window.saveProductWithAPI(productData);
+                    return; // Exit if API save successful
+                } catch (apiError) {
+                    console.error('API save failed, falling back to localStorage:', apiError);
+                    // Continue to localStorage fallback below
+                }
+            }
+
+            // Fallback to localStorage
+            products[productId] = productData;
             localStorage.setItem('productConfigurations', JSON.stringify(products));
             renderProductsTable();
             populateProductDropdown(true);

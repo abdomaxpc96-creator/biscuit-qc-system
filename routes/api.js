@@ -185,15 +185,34 @@ router.post('/products', asyncHandler(async (req, res) => {
       `, [productUuid, variable.name, variable.value, variable.description]);
     }
     
-    // Insert sections and parameters
+    // Insert sections and parameters with full metadata serialization
     for (const section of sections) {
       const sectionResult = await client.query(`
         INSERT INTO product_sections (product_id, section_id, section_name, section_type, order_index)
         VALUES ($1, $2, $3, $4, $5) RETURNING id
-      `, [productUuid, section.section_id, section.section_name, section.section_type, section.order_index]);
+      `, [productUuid, section.section_id, section.section_name, section.section_type || 'quality_control', section.order_index || 0]);
       
       const sectionUuid = sectionResult.rows[0].id;
       
+      // Store section metadata as a special parameter to preserve UI structure
+      if (section.metadata) {
+        await client.query(`
+          INSERT INTO product_parameters (
+            section_id, parameter_id, parameter_name, parameter_type,
+            validation_rule, order_index, is_required
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        `, [
+          sectionUuid,
+          '__section_metadata__',
+          'Section Metadata',
+          'metadata',
+          JSON.stringify(section.metadata),
+          -1,
+          false
+        ]);
+      }
+      
+      // Insert regular parameters
       for (const parameter of section.parameters || []) {
         await client.query(`
           INSERT INTO product_parameters (
@@ -202,11 +221,15 @@ router.post('/products', asyncHandler(async (req, res) => {
             is_required
           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `, [
-          sectionUuid, parameter.parameter_id, parameter.parameter_name,
-          parameter.parameter_type, parameter.default_value,
-          JSON.stringify(parameter.validation_rule),
-          JSON.stringify(parameter.calculation_formula),
-          parameter.order_index, parameter.is_required
+          sectionUuid,
+          parameter.parameter_id,
+          parameter.parameter_name,
+          parameter.parameter_type || 'text',
+          parameter.default_value,
+          JSON.stringify(parameter.validation_rule || {}),
+          JSON.stringify(parameter.calculation_formula || {}),
+          parameter.order_index || 0,
+          parameter.is_required || false
         ]);
       }
     }
@@ -225,7 +248,7 @@ router.post('/products', asyncHandler(async (req, res) => {
   res.status(201).json(configResult.rows[0].config);
 }));
 
-// PUT /api/products/:id - Update product
+// PUT /api/products/:id - Update product with full configuration
 router.put('/products/:id', asyncHandler(async (req, res) => {
   const { id } = req.params;
   
@@ -233,17 +256,125 @@ router.put('/products/:id', asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Invalid product ID format' });
   }
   
-  const updateData = { ...req.body };
-  delete updateData.id; // Remove ID from update data
-  delete updateData.created_at; // Remove immutable fields
-  delete updateData.customVariables;
-  delete updateData.sections;
-  
-  const updated = await db.updateById('products', id, updateData);
-  
-  if (!updated) {
+  // Check if product exists
+  const existingProduct = await db.findById('products', id);
+  if (!existingProduct) {
     return res.status(404).json({ error: 'Product not found' });
   }
+  
+  const {
+    customVariables,
+    sections,
+    ...productData
+  } = req.body;
+  
+  // Remove immutable fields
+  delete productData.id;
+  delete productData.created_at;
+  delete productData.updated_at;
+  
+  await db.transaction(async (client) => {
+    // Update core product fields
+    if (Object.keys(productData).length > 0) {
+      const updateFields = [];
+      const updateValues = [];
+      let paramIndex = 1;
+      
+      // Build dynamic update query
+      Object.keys(productData).forEach(key => {
+        if (productData[key] !== undefined) {
+          updateFields.push(`${key} = $${paramIndex++}`);
+          updateValues.push(productData[key]);
+        }
+      });
+      
+      if (updateFields.length > 0) {
+        updateFields.push(`updated_at = CURRENT_TIMESTAMP`);
+        updateValues.push(id);
+        
+        await client.query(`
+          UPDATE products
+          SET ${updateFields.join(', ')}
+          WHERE id = $${paramIndex}
+        `, updateValues);
+      }
+    }
+    
+    // Update custom variables if provided
+    if (customVariables !== undefined) {
+      // Delete existing custom variables
+      await client.query(
+        'DELETE FROM product_custom_variables WHERE product_id = $1',
+        [id]
+      );
+      
+      // Insert new custom variables
+      for (const variable of customVariables) {
+        await client.query(`
+          INSERT INTO product_custom_variables (product_id, name, value, description)
+          VALUES ($1, $2, $3, $4)
+        `, [id, variable.name, variable.value, variable.description]);
+      }
+    }
+    
+    // Update sections and parameters if provided
+    if (sections !== undefined) {
+      // Delete existing sections (cascade will delete parameters)
+      await client.query(
+        'DELETE FROM product_sections WHERE product_id = $1',
+        [id]
+      );
+      
+      // Insert new sections and parameters with metadata
+      for (const section of sections) {
+        const sectionResult = await client.query(`
+          INSERT INTO product_sections (product_id, section_id, section_name, section_type, order_index)
+          VALUES ($1, $2, $3, $4, $5) RETURNING id
+        `, [id, section.section_id, section.section_name, section.section_type || 'quality_control', section.order_index || 0]);
+        
+        const sectionUuid = sectionResult.rows[0].id;
+        
+        // Store section metadata as a special parameter
+        if (section.metadata) {
+          await client.query(`
+            INSERT INTO product_parameters (
+              section_id, parameter_id, parameter_name, parameter_type,
+              validation_rule, order_index, is_required
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+          `, [
+            sectionUuid,
+            '__section_metadata__',
+            'Section Metadata',
+            'metadata',
+            JSON.stringify(section.metadata),
+            -1,
+            false
+          ]);
+        }
+        
+        // Insert regular parameters
+        for (const parameter of section.parameters || []) {
+          await client.query(`
+            INSERT INTO product_parameters (
+              section_id, parameter_id, parameter_name, parameter_type,
+              default_value, validation_rule, calculation_formula, order_index,
+              is_required
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          `, [
+            sectionUuid,
+            parameter.parameter_id,
+            parameter.parameter_name,
+            parameter.parameter_type || 'text',
+            parameter.default_value,
+            JSON.stringify(parameter.validation_rule || {}),
+            JSON.stringify(parameter.calculation_formula || {}),
+            parameter.order_index || 0,
+            parameter.is_required || false
+          ]);
+        }
+      }
+    }
+  });
   
   // Return updated product with full configuration
   const configResult = await db.query('SELECT get_product_configuration($1) as config', [id]);
